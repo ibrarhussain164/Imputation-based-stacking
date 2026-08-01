@@ -35,6 +35,7 @@ suppressPackageStartupMessages({
   library(cowplot)
   library(grid)
   library(magrittr)
+  library(missForest)
 })
 
 options(warn = -1)
@@ -185,7 +186,7 @@ cat("Output directory:", output_dir, "\n")
 # DATA PATH
 # -----------------------------------------------------------------------------
 # Option 1: Excel file
-abm_file_path <- Sys.getenv("ABM_DATA_FILE", unset = "Abm.xlsx")
+abm_file_path <- Sys.getenv("ABM_DATA_FILE", unset = "~/Desktop/project 1/Abm.xlsx")
 
 # Option 2: SPSS file
 # abm_file_path <- "abm.sav"
@@ -210,7 +211,9 @@ n_random_splits  <- 50
 missing_setting_label <- "Natural"
 
 methods <- c("pmm", "rf", "cart", "norm", "midastouch")
-method_order <- c("PMM", "RF", "CART", "NORM", "MIDASTOUCH", "Stacking")
+method_order <- c("CCA", "Mean", "MissInd", "MissForest",
+                  "PMM", "RF", "CART", "NORM", "MIDASTOUCH",
+                  "MIE_SE_GLM", "MIE_SE_KNN", "MIE_SE_DT", "Stacking")
 classifier_models <- c("GLM", "KNN", "DT")
 
 cv_folds_standard <- 5
@@ -470,7 +473,7 @@ cat("\n")
 compute_auc <- function(true_y, pred_prob) {
   true_y <- factor(true_y, levels = c("neg", "pos"))
   pred_prob <- as.numeric(pred_prob)
-  if (length(unique(true_y)) < 2) return(NA_real_)
+  if (length(unique(na.omit(droplevels(true_y)))) < 2) return(NA_real_)
   if (all(is.na(pred_prob))) return(NA_real_)
   
   roc_obj <- tryCatch(
@@ -485,7 +488,7 @@ compute_auc <- function(true_y, pred_prob) {
 brier_score <- function(true_y, pred_prob) {
   true_y <- factor(true_y, levels = c("neg", "pos"))
   pred_prob <- as.numeric(pred_prob)
-  if (length(unique(true_y)) < 2) return(NA_real_)
+  if (length(unique(na.omit(droplevels(true_y)))) < 2) return(NA_real_)
   if (all(is.na(pred_prob))) return(NA_real_)
   
   true_numeric <- as.numeric(true_y == "pos")
@@ -493,10 +496,10 @@ brier_score <- function(true_y, pred_prob) {
 }
 
 precision_score <- function(true_y, pred_class) {
-  true_y <- factor(true_y, levels = c("neg", "pos"))
+  true_y    <- factor(true_y,    levels = c("neg", "pos"))
   pred_class <- factor(pred_class, levels = c("neg", "pos"))
   
-  if (length(unique(true_y)) < 2) return(NA_real_)
+  if (length(unique(na.omit(droplevels(true_y)))) < 2) return(NA_real_)
   
   cm <- tryCatch(
     caret::confusionMatrix(pred_class, true_y, positive = "pos"),
@@ -511,7 +514,7 @@ confusion_metrics <- function(true_y, pred_class) {
   true_y <- factor(true_y, levels = c("neg", "pos"))
   pred_class <- factor(pred_class, levels = c("neg", "pos"))
   
-  if (length(unique(true_y)) < 2) {
+  if (length(unique(na.omit(droplevels(true_y)))) < 2) {
     return(list(
       Sensitivity = NA_real_,
       Specificity = NA_real_,
@@ -546,6 +549,23 @@ confusion_metrics <- function(true_y, pred_class) {
     Sensitivity = sensitivity,
     Specificity = specificity,
     F1          = f1
+  )
+}
+
+compute_calibration <- function(obs_y, pred_prob) {
+  if (is.factor(obs_y)) obs_y_num <- as.numeric(obs_y == "pos") else obs_y_num <- as.numeric(obs_y)
+  pred_prob <- pmin(pmax(as.numeric(pred_prob), 1e-6), 1 - 1e-6)
+  if (length(unique(obs_y_num)) < 2 || length(pred_prob) < 5) {
+    return(list(cal_slope = NA_real_, cal_intercept = NA_real_))
+  }
+  logit_pred <- log(pred_prob / (1 - pred_prob))
+  cal_fit <- tryCatch(
+    glm(obs_y_num ~ logit_pred, family = binomial()),
+    error = function(e) NULL
+  )
+  list(
+    cal_intercept = if (!is.null(cal_fit)) as.numeric(coef(cal_fit)[1]) else NA_real_,
+    cal_slope     = if (!is.null(cal_fit)) as.numeric(coef(cal_fit)[2]) else NA_real_
   )
 }
 
@@ -963,14 +983,29 @@ all_results               <- list()
 all_test_tables           <- list()
 all_missingness_variable  <- list()
 all_missingness_overall   <- list()
+all_timing                <- list()    # <<< NEW: per-split timing
 
 for (scenario_name in names(source_datasets)) {
   
   dat <- source_datasets[[scenario_name]]
   
-  scenario_results <- data.frame()
   scenario_missingness_variable <- data.frame()
   scenario_missingness_overall  <- data.frame()
+  scenario_timing <- data.frame()
+  
+  # ---- Checkpoint / resume --------------------------------------------------
+  checkpoint_file <- file.path(output_dir, paste0("checkpoint_", scenario_name, "_raw_results.csv"))
+  if (file.exists(checkpoint_file)) {
+    scenario_results <- readr::read_csv(checkpoint_file, show_col_types = FALSE)
+    scenario_results$Imputation_Method <- as.character(scenario_results$Imputation_Method)
+    completed_keys <- unique(paste(scenario_results$Split, sep = "_"))
+    cat("  Checkpoint loaded:", nrow(scenario_results), "rows,",
+        length(completed_keys), "splits already done.\n")
+  } else {
+    scenario_results <- data.frame()
+    completed_keys   <- character(0)
+  }
+  # ---------------------------------------------------------------------------
   
   cat("============================================================\n")
   cat("Running scenario:", scenario_name, "\n")
@@ -981,7 +1016,17 @@ for (scenario_name in names(source_datasets)) {
     
     cat("  Random split:", split_id, "of", n_random_splits, "\n")
     
+    # Skip if already completed
+    split_key <- as.character(split_id)
+    if (split_key %in% completed_keys) {
+      cat("  Split", split_id, "- skipping (checkpoint)\n")
+      next
+    }
+    n_before_split <- nrow(scenario_results)
+    
     data_seed <- main_seed + split_id * 10000
+    
+    split_start_time <- proc.time()
     
     set.seed(data_seed + 1)
     index <- caret::createDataPartition(dat$y, p = train_fraction, list = FALSE)
@@ -1114,6 +1159,7 @@ for (scenario_name in names(source_datasets)) {
         
         test_class <- factor(ifelse(pooled_test_prob >= model_threshold, "pos", "neg"), levels = c("neg", "pos"))
         test_cm_stats <- confusion_metrics(test_y, test_class)
+        cal_mice <- compute_calibration(test_y, pooled_test_prob)
         
         scenario_results <- bind_rows(scenario_results, data.frame(
           Scenario           = scenario_name,
@@ -1135,8 +1181,119 @@ for (scenario_name in names(source_datasets)) {
           Test_Specificity   = test_cm_stats$Specificity,
           Train_F1           = train_cm_stats$F1,
           Test_F1            = test_cm_stats$F1,
-          Threshold          = model_threshold
+          Threshold          = model_threshold,
+          Cal_Slope          = cal_mice$cal_slope,
+          Cal_Intercept      = cal_mice$cal_intercept
         ))
+      }
+    }
+    
+    # ---- Simple baselines: CCA, Mean, MissInd, MissForest (R1-C6 / R2-C1) ---
+    
+    # Helper to build one result row (ABM version)
+    store_abm_single <- function(method_name, clf, cv_pred_obj, test_prob_vec) {
+      thresh    <- find_optimal_threshold(cv_pred_obj$obs, cv_pred_obj$pos)
+      tr_prob   <- cv_pred_obj$pos
+      tr_cl     <- factor(ifelse(tr_prob       >= thresh, "pos", "neg"), levels = c("neg","pos"))
+      te_cl     <- factor(ifelse(test_prob_vec >= thresh, "pos", "neg"), levels = c("neg","pos"))
+      tr_cm     <- confusion_metrics(cv_pred_obj$obs, tr_cl)
+      te_cm     <- confusion_metrics(test_y,          te_cl)
+      cal       <- compute_calibration(test_y, test_prob_vec)
+      data.frame(
+        Scenario = scenario_name, Split = split_id,
+        Missing_Setting = missing_setting_label,
+        Imputation_Method = method_name, Model = clf,
+        Train_AUC      = compute_auc(cv_pred_obj$obs, tr_prob),
+        Test_AUC       = compute_auc(test_y, test_prob_vec),
+        Train_Accuracy = mean(tr_cl == cv_pred_obj$obs),
+        Test_Accuracy  = mean(te_cl == test_y),
+        Train_Brier    = brier_score(cv_pred_obj$obs, tr_prob),
+        Test_Brier     = brier_score(test_y, test_prob_vec),
+        Train_Precision   = precision_score(cv_pred_obj$obs, tr_cl),
+        Test_Precision    = precision_score(test_y, te_cl),
+        Train_Sensitivity = tr_cm$Sensitivity, Test_Sensitivity = te_cm$Sensitivity,
+        Train_Specificity = tr_cm$Specificity, Test_Specificity = te_cm$Specificity,
+        Train_F1 = tr_cm$F1, Test_F1 = te_cm$F1, Threshold = thresh,
+        Cal_Slope = cal$cal_slope, Cal_Intercept = cal$cal_intercept
+      )
+    }
+    
+    # 1) CCA
+    cat("    Method: CCA\n")
+    cca_complete <- complete.cases(train_x)
+    if (sum(cca_complete) >= 10) {
+      train_x_cca <- train_x[cca_complete, , drop = FALSE]
+      train_y_cca <- train_y[cca_complete]
+      tmeans_cca  <- colMeans(train_x, na.rm = TRUE)
+      test_x_cca  <- as.data.frame(lapply(names(test_x), function(col) {
+        v <- test_x[[col]]; v[is.na(v)] <- tmeans_cca[[col]]; v
+      })); names(test_x_cca) <- names(test_x)
+      for (clf in classifier_models) {
+        fit_cca <- fit_model_with_cv_predictions(
+          data.frame(train_x_cca, y = train_y_cca), test_x_cca, clf,
+          seed = data_seed + 30000 + match(clf, classifier_models) * 10,
+          cv_folds = cv_folds_standard)
+        scenario_results <- bind_rows(scenario_results,
+                                      store_abm_single("CCA", clf, fit_cca$cv_pred, fit_cca$test_prob))
+      }
+    }
+    
+    # 2) Mean imputation
+    cat("    Method: Mean Imputation\n")
+    tmeans_m     <- colMeans(train_x, na.rm = TRUE)
+    train_x_mean <- train_x; test_x_mean <- test_x
+    for (col in names(train_x_mean)) {
+      train_x_mean[[col]][is.na(train_x_mean[[col]])] <- tmeans_m[[col]]
+      test_x_mean[[col]][is.na(test_x_mean[[col]])]   <- tmeans_m[[col]]
+    }
+    for (clf in classifier_models) {
+      fit_m <- fit_model_with_cv_predictions(
+        data.frame(train_x_mean, y = train_y), test_x_mean, clf,
+        seed = data_seed + 31000 + match(clf, classifier_models) * 10,
+        cv_folds = cv_folds_standard)
+      scenario_results <- bind_rows(scenario_results,
+                                    store_abm_single("Mean", clf, fit_m$cv_pred, fit_m$test_prob))
+    }
+    
+    # 3) Missing indicator ─ binary flag per missing predictor + mean-fill (Sterne et al. 2009)
+    cat("    Method: Missing Indicator\n")
+    hmiss        <- names(train_x)[sapply(train_x, function(x) any(is.na(x)))]
+    train_x_ind  <- train_x; test_x_ind <- test_x
+    for (col in hmiss) {
+      train_x_ind[[paste0(col, "_miss")]] <- as.numeric(is.na(train_x[[col]]))
+      test_x_ind[[paste0(col,  "_miss")]] <- as.numeric(is.na(test_x[[col]]))
+      train_x_ind[[col]][is.na(train_x_ind[[col]])] <- tmeans_m[[col]]
+      test_x_ind[[col]][is.na(test_x_ind[[col]])]   <- tmeans_m[[col]]
+    }
+    for (clf in classifier_models) {
+      fit_ind <- fit_model_with_cv_predictions(
+        data.frame(train_x_ind, y = train_y), test_x_ind, clf,
+        seed = data_seed + 32000 + match(clf, classifier_models) * 10,
+        cv_folds = cv_folds_standard)
+      scenario_results <- bind_rows(scenario_results,
+                                    store_abm_single("MissInd", clf, fit_ind$cv_pred, fit_ind$test_prob))
+    }
+    
+    # 4) MissForest
+    cat("    Method: MissForest\n")
+    n_tr_mf      <- nrow(train_x)
+    comb_x_mf    <- rbind(as.data.frame(train_x), as.data.frame(test_x))
+    set.seed(data_seed + 33000)
+    mf_out_abm <- tryCatch(
+      missForest::missForest(comb_x_mf, verbose = FALSE),
+      error = function(e) { message("MissForest failed: ", e$message); NULL }
+    )
+    if (!is.null(mf_out_abm)) {
+      cimp_abm    <- as.data.frame(mf_out_abm$ximp)
+      train_x_mf  <- cimp_abm[seq_len(n_tr_mf), , drop = FALSE]
+      test_x_mf   <- cimp_abm[(n_tr_mf + 1):nrow(cimp_abm), , drop = FALSE]
+      for (clf in classifier_models) {
+        fit_mf <- fit_model_with_cv_predictions(
+          data.frame(train_x_mf, y = train_y), test_x_mf, clf,
+          seed = data_seed + 33000 + match(clf, classifier_models) * 10,
+          cv_folds = cv_folds_standard)
+        scenario_results <- bind_rows(scenario_results,
+                                      store_abm_single("MissForest", clf, fit_mf$cv_pred, fit_mf$test_prob))
       }
     }
     
@@ -1236,6 +1393,7 @@ for (scenario_name in names(source_datasets)) {
       
       stacking_class <- factor(ifelse(stacking_pred_avg >= final_stack_threshold, "pos", "neg"), levels = c("neg", "pos"))
       stack_test_cm  <- confusion_metrics(test_y, stacking_class)
+      cal_stack      <- compute_calibration(test_y, stacking_pred_avg)
       
       scenario_results <- bind_rows(scenario_results, data.frame(
         Scenario           = scenario_name,
@@ -1257,9 +1415,118 @@ for (scenario_name in names(source_datasets)) {
         Test_Specificity   = stack_test_cm$Specificity,
         Train_F1           = stack_train_cm$F1,
         Test_F1            = stack_test_cm$F1,
-        Threshold          = final_stack_threshold
+        Threshold          = final_stack_threshold,
+        Cal_Slope          = cal_stack$cal_slope,
+        Cal_Intercept      = cal_stack$cal_intercept
       ))
     }
+    
+    # ---- MIE_SE: Multiple Imputation Ensemble Stacking (Aleryani et al.) ------
+    # MICE_SE variant: PMM (m=5 draws) x GLM+KNN+DT = 15 OOF predictions as meta-features.
+    # Meta-learner runs once per classifier → 3 rows: MIE_SE_GLM, MIE_SE_KNN, MIE_SE_DT.
+    # Base model seeds: 20000 range. Meta-learner seeds: data_seed + 25000 range.
+    cat("    Model: ALL | Method: MIE_SE (PMM x GLM+KNN+DT, per-clf meta-learner)\n")
+    
+    mie_se_oof_list  <- list()
+    mie_se_test_list <- list()
+    mie_se_idx <- 1
+    
+    for (imp_idx in seq_len(m)) {
+      for (clf in classifier_models) {
+        fit_mie <- fit_model_with_cv_predictions(
+          train_df   = train_imputed[["pmm"]][[imp_idx]],
+          test_df    = test_imputed[["pmm"]][[imp_idx]],
+          model_type = clf,
+          seed       = data_seed + 20000 + match(clf, classifier_models) * 10 + imp_idx,
+          cv_folds   = cv_folds_standard
+        )
+        col_name <- paste0("pmm_k", imp_idx, "_", clf, "_pred")
+        mie_se_oof_list[[mie_se_idx]]  <- fit_mie$cv_pred %>%
+          transmute(row_id = rowIndex, !!col_name := pos)
+        mie_se_test_list[[mie_se_idx]] <- fit_mie$test_prob
+        mie_se_idx <- mie_se_idx + 1
+      }
+    }
+    
+    mie_se_oof <- Reduce(function(x, y) full_join(x, y, by = "row_id"), mie_se_oof_list) %>%
+      arrange(row_id)
+    mie_se_meta_cols <- grep("_pred$", names(mie_se_oof), value = TRUE)
+    
+    meta_train_mie <- data.frame(
+      y = train_y[mie_se_oof$row_id],
+      mie_se_oof[, mie_se_meta_cols]
+    )
+    mie_se_test_df <- as.data.frame(do.call(cbind, mie_se_test_list))
+    colnames(mie_se_test_df) <- mie_se_meta_cols
+    
+    # One meta-learner per classifier
+    for (clf_meta in classifier_models) {
+      mie_label <- paste0("MIE_SE_", clf_meta)
+      f_meta <- fit_model_with_cv_predictions(
+        train_df   = meta_train_mie,
+        test_df    = mie_se_test_df,
+        model_type = clf_meta,
+        seed       = data_seed + 25000 + match(clf_meta, classifier_models) * 100,
+        cv_folds   = cv_folds_meta
+      )
+      meta_oof <- f_meta$cv_pred %>% arrange(rowIndex)
+      mie_se_train_prob <- meta_oof$pos
+      mie_se_train_obs  <- meta_oof$obs
+      mie_se_train_prob[!is.finite(mie_se_train_prob)] <- mean(train_y == "pos")
+      thresh_mie_se      <- find_optimal_threshold(mie_se_train_obs, mie_se_train_prob)
+      mie_se_train_class <- factor(ifelse(mie_se_train_prob >= thresh_mie_se, "pos", "neg"), levels = c("neg", "pos"))
+      mie_se_train_cm    <- confusion_metrics(mie_se_train_obs, mie_se_train_class)
+      
+      mie_se_test_prob  <- f_meta$test_prob
+      mie_se_test_prob[!is.finite(mie_se_test_prob)] <- mean(train_y == "pos")
+      mie_se_test_class <- factor(ifelse(mie_se_test_prob >= thresh_mie_se, "pos", "neg"), levels = c("neg", "pos"))
+      mie_se_test_cm    <- confusion_metrics(test_y, mie_se_test_class)
+      cal_mie           <- compute_calibration(test_y, mie_se_test_prob)
+      
+      scenario_results <- bind_rows(scenario_results, data.frame(
+        Scenario           = scenario_name,
+        Split              = split_id,
+        Missing_Setting    = missing_setting_label,
+        Imputation_Method  = mie_label,
+        Model              = mie_label,
+        Train_AUC          = compute_auc(mie_se_train_obs, mie_se_train_prob),
+        Test_AUC           = compute_auc(test_y, mie_se_test_prob),
+        Train_Accuracy     = mean(mie_se_train_class == mie_se_train_obs),
+        Test_Accuracy      = mean(mie_se_test_class == test_y),
+        Train_Brier        = brier_score(mie_se_train_obs, mie_se_train_prob),
+        Test_Brier         = brier_score(test_y, mie_se_test_prob),
+        Train_Precision    = precision_score(mie_se_train_obs, mie_se_train_class),
+        Test_Precision     = precision_score(test_y, mie_se_test_class),
+        Train_Sensitivity  = mie_se_train_cm$Sensitivity,
+        Test_Sensitivity   = mie_se_test_cm$Sensitivity,
+        Train_Specificity  = mie_se_train_cm$Specificity,
+        Test_Specificity   = mie_se_test_cm$Specificity,
+        Train_F1           = mie_se_train_cm$F1,
+        Test_F1            = mie_se_test_cm$F1,
+        Threshold          = thresh_mie_se,
+        Cal_Slope          = cal_mie$cal_slope,
+        Cal_Intercept      = cal_mie$cal_intercept
+      ))
+    }
+    
+    # ---- Record per-split computational cost --------------------------------
+    split_elapsed <- (proc.time() - split_start_time)[["elapsed"]]
+    scenario_timing <- bind_rows(scenario_timing, data.frame(
+      Scenario        = scenario_name,
+      Split           = split_id,
+      Missing_Setting = missing_setting_label,
+      Elapsed_Seconds = split_elapsed
+    ))
+    
+    # ---- Checkpoint: append this split's rows to disk -----------------------
+    new_rows <- if (nrow(scenario_results) > n_before_split)
+      scenario_results[(n_before_split + 1):nrow(scenario_results), ] else data.frame()
+    if (nrow(new_rows) > 0) {
+      readr::write_csv(new_rows, checkpoint_file, append = file.exists(checkpoint_file))
+      completed_keys <- c(completed_keys, split_key)
+      cat("  Split", split_id, "checkpointed (", nrow(new_rows), "rows )\n")
+    }
+    # -------------------------------------------------------------------------
   }
   
   scenario_results <- scenario_results %>%
@@ -1286,11 +1553,34 @@ for (scenario_name in names(source_datasets)) {
     file.path(output_dir, "scenario_raw_results", paste0(scenario_name, "_raw_results.csv"))
   )
   
+  # ---- Save per-split timing for this scenario ----------------------------
+  timing_summary_scenario <- scenario_timing %>%
+    summarise(
+      Scenario             = scenario_name,
+      Missing_Setting      = missing_setting_label,
+      Mean_Elapsed_Seconds = mean(Elapsed_Seconds, na.rm = TRUE),
+      SD_Elapsed_Seconds   = sd(Elapsed_Seconds, na.rm = TRUE),
+      Min_Elapsed_Seconds  = min(Elapsed_Seconds, na.rm = TRUE),
+      Max_Elapsed_Seconds  = max(Elapsed_Seconds, na.rm = TRUE),
+      n_splits             = n()
+    )
+  safe_write_csv(
+    scenario_timing,
+    file.path(output_dir, paste0(scenario_name, "_per_split_timing.csv"))
+  )
+  safe_write_csv(
+    timing_summary_scenario,
+    file.path(output_dir, paste0(scenario_name, "_timing_summary.csv"))
+  )
+  
+  all_timing[[scenario_name]] <- scenario_timing
+  
   scenario_test_table <- scenario_results %>%
     select(
       Scenario, Split, Missing_Setting, Imputation_Method, Model,
       Test_AUC, Test_Accuracy, Test_Brier, Test_Precision,
-      Test_Sensitivity, Test_Specificity, Test_F1, Threshold
+      Test_Sensitivity, Test_Specificity, Test_F1, Threshold,
+      Cal_Slope, Cal_Intercept
     ) %>%
     arrange(Split, Model, Imputation_Method)
   
@@ -1360,6 +1650,10 @@ safe_write_csv(combined_test_metrics, test_metrics_file)
 safe_write_csv(combined_missingness_variable, missing_var_file)
 safe_write_csv(combined_missingness_overall, missing_overall_file)
 safe_write_csv(combined_missingness_comparison, missing_comparison_file)
+
+# ---- Save combined timing across all scenarios --------------------------
+combined_timing <- bind_rows(all_timing)
+safe_write_csv(combined_timing, file.path(output_dir, "all_scenarios_per_split_timing.csv"))
 
 # =============================================================================
 # POST-ANALYSIS / SUMMARY / RANKING / FIGURES
@@ -1551,7 +1845,9 @@ final_results <- combined_results %>%
 
 final_results$Method <- factor(
   final_results$Method,
-  levels = c("PMM", "RF", "CART", "NORM", "MIDASTOUCH", "Stacking")
+  levels = c("CCA", "Mean", "MissInd", "MissForest",
+             "PMM", "RF", "CART", "NORM", "MIDASTOUCH",
+             "MIE_SE_GLM", "MIE_SE_KNN", "MIE_SE_DT", "Stacking")
 )
 
 final_results$Model <- factor(
@@ -1796,6 +2092,43 @@ safe_write_csv(combined_rank_table_glm, file.path(output_dir, "post_analysis", "
 safe_write_csv(combined_rank_table_knn, file.path(output_dir, "post_analysis", "KNN_combined_rank_table.csv"))
 safe_write_csv(combined_rank_table_dt,  file.path(output_dir, "post_analysis", "DT_combined_rank_table.csv"))
 
+make_paper_rank_table <- function(combined_df) {
+  # Rename any Rank_0.x columns -> "x0%" (handles MCAR/MAR style; ABM has none)
+  rank_col_pattern <- grep("^Rank_", names(combined_df), value = TRUE)
+  if (length(rank_col_pattern) > 0) {
+    new_names <- sapply(rank_col_pattern, function(m) {
+      pct <- as.numeric(sub("Rank_", "", m)) * 100
+      paste0(round(pct), "%")
+    })
+    names(combined_df)[match(rank_col_pattern, names(combined_df))] <- new_names
+  }
+  
+  # Sort by Metric then Overall_Rank
+  combined_df <- combined_df[order(combined_df$Metric, combined_df$Overall_Rank), ]
+  
+  # Move Metric to first column
+  other_cols <- setdiff(names(combined_df), "Metric")
+  combined_df <- combined_df[, c("Metric", other_cols)]
+  
+  # Show W and p_value only on first row of each metric group
+  if ("p_value" %in% names(combined_df)) {
+    combined_df$p_value <- ifelse(!is.na(combined_df$p_value) & combined_df$p_value < 0.001,
+                                  "<0.001", as.character(combined_df$p_value))
+    first_row <- !duplicated(combined_df$Metric)
+    if ("W" %in% names(combined_df)) combined_df$W[!first_row] <- NA
+    combined_df$p_value[!first_row] <- NA
+  }
+  
+  combined_df
+}
+
+safe_write_csv(make_paper_rank_table(as.data.frame(combined_rank_table_glm)),
+               file.path(output_dir, "post_analysis", "GLM_paper_rank_table.csv"))
+safe_write_csv(make_paper_rank_table(as.data.frame(combined_rank_table_knn)),
+               file.path(output_dir, "post_analysis", "KNN_paper_rank_table.csv"))
+safe_write_csv(make_paper_rank_table(as.data.frame(combined_rank_table_dt)),
+               file.path(output_dir, "post_analysis", "DT_paper_rank_table.csv"))
+
 # =============================================================================
 # 15) SAVE MEAN ± SD TABLES
 # =============================================================================
@@ -1899,8 +2232,89 @@ objects_to_save <- c(
   "overfit_dt_word",
   "abm_variable_map",
   "abm_excluded_variables",
-  "selected_abm_numeric_predictors"
+  "selected_abm_numeric_predictors",
+  "combined_timing"
 )
+
+# =============================================================================
+# PAIRED DIFFERENCES + WIN PROPORTIONS (R1-C5)
+# =============================================================================
+
+individual_methods_abm <- c("PMM", "RF", "CART", "NORM", "MIDASTOUCH",
+                            "CCA", "Mean", "MissInd", "MissForest")
+
+abm_paired_diff <- data.frame()
+
+for (sc_name in unique(as.character(combined_results$Scenario))) {
+  for (model_name in c("GLM", "KNN", "DT")) {
+    sub <- combined_results %>%
+      filter(as.character(Scenario) == sc_name,
+             as.character(Model) == model_name,
+             as.character(Imputation_Method) %in%
+               c("Stacking", individual_methods_abm))
+    if (nrow(sub) == 0) next
+    wide <- sub %>%
+      select(Split, Imputation_Method, Test_AUC) %>%
+      mutate(Imputation_Method = as.character(Imputation_Method)) %>%
+      pivot_wider(names_from = Imputation_Method, values_from = Test_AUC)
+    if (!"Stacking" %in% names(wide)) next
+    icols <- intersect(individual_methods_abm, names(wide))
+    if (length(icols) == 0) next
+    best_indiv <- apply(wide[, icols, drop = FALSE], 1, max, na.rm = TRUE)
+    diff_vec   <- wide$Stacking - best_indiv
+    n          <- sum(!is.na(diff_vec))
+    if (n < 2) next
+    mean_diff <- mean(diff_vec, na.rm = TRUE)
+    sd_diff   <- sd(diff_vec, na.rm = TRUE)
+    se_diff   <- sd_diff / sqrt(n)
+    abm_paired_diff <- bind_rows(abm_paired_diff, data.frame(
+      Scenario = sc_name, Model = model_name,
+      Missing_Setting = missing_setting_label,
+      Metric = "AUC", n_splits = n,
+      Mean_Diff = mean_diff, SD_Diff = sd_diff,
+      CI_Lower = mean_diff - qt(0.975, df = n-1) * se_diff,
+      CI_Upper = mean_diff + qt(0.975, df = n-1) * se_diff,
+      Win_Proportion = mean(diff_vec > 0, na.rm = TRUE)
+    ))
+  }
+}
+
+safe_write_csv(
+  abm_paired_diff,
+  file.path(output_dir, "post_analysis", "stacking_paired_diff_win_prop.csv")
+)
+
+# =============================================================================
+# CALIBRATION ANALYSIS (R1-C8) — Cox slope/intercept summary
+# (compute_calibration defined at top of script; called inline per split above)
+# =============================================================================
+
+# Summarise Cox calibration (slope + intercept) from per-split stored values.
+# Cal_Slope and Cal_Intercept were computed inline for every split/method above.
+# Here we aggregate across splits per Scenario × Model × Method.
+cal_summary <- combined_results %>%
+  group_by(Scenario, Missing_Setting, Imputation_Method, Model) %>%
+  summarise(
+    Mean_Cal_Slope      = mean(Cal_Slope,     na.rm = TRUE),
+    SD_Cal_Slope        = sd(Cal_Slope,       na.rm = TRUE),
+    Mean_Cal_Intercept  = mean(Cal_Intercept, na.rm = TRUE),
+    SD_Cal_Intercept    = sd(Cal_Intercept,   na.rm = TRUE),
+    n_splits_cal        = sum(!is.na(Cal_Slope)),
+    Mean_Test_AUC       = mean(Test_AUC,      na.rm = TRUE),
+    Mean_Test_Brier     = mean(Test_Brier,    na.rm = TRUE),
+    Mean_Sensitivity    = mean(Test_Sensitivity, na.rm = TRUE),
+    Mean_Specificity    = mean(Test_Specificity, na.rm = TRUE),
+    n_splits            = n(),
+    .groups = "drop"
+  )
+
+safe_write_csv(
+  cal_summary,
+  file.path(output_dir, "post_analysis", "calibration_summary.csv")
+)
+
+# Update objects to save
+objects_to_save <- c(objects_to_save, "abm_paired_diff", "cal_summary")
 
 safe_save_rdata(
   object_names = objects_to_save,
@@ -1944,6 +2358,10 @@ cat("  - GLM_combined_rank_table.csv\n")
 cat("  - KNN_combined_rank_table.csv\n")
 cat("  - DT_combined_rank_table.csv\n")
 cat("  - results_backup.RData\n")
+cat("\nNew outputs (MIE_SE + timing):\n")
+cat("  - ABM_per_split_timing.csv  (in output_dir root)\n")
+cat("  - ABM_timing_summary.csv    (in output_dir root)\n")
+cat("  - all_scenarios_per_split_timing.csv\n")
+cat("  MIE_SE rows stored with Imputation_Method='MIE_SE', Model='MIE_SE' in all result files.\n")
 cat("\nFigure files are generated separately by running R/02_abm_figures.R after this script.\n")
 cat("=======================================================\n")
-
