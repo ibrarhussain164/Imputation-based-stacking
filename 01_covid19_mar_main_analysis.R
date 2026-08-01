@@ -33,9 +33,11 @@ suppressPackageStartupMessages({
   library(cowplot)
   library(grid)
   library(magrittr)
+  library(missForest)
 })
 
 options(warn = -1)
+select <- dplyr::select   # prevent MASS::select conflict
 
 
 # =============================================================================
@@ -45,26 +47,26 @@ options(warn = -1)
 safe_write_csv <- function(df, path) {
   dir.create(dirname(path), recursive = TRUE, showWarnings = FALSE)
   tmp_path <- paste0(path, ".tmp")
-
+  
   if (file.exists(tmp_path)) {
     unlink(tmp_path, force = TRUE)
   }
-
+  
   readr::write_csv(as.data.frame(df), tmp_path)
-
+  
   if (file.exists(path)) {
     unlink(path, force = TRUE)
   }
-
+  
   ok <- file.rename(tmp_path, path)
-
+  
   if (!ok) {
     stop(paste0(
       "Could not write file: ", path, "\n",
       "Close the file if it is open and run the script again."
     ))
   }
-
+  
   invisible(path)
 }
 
@@ -106,7 +108,10 @@ if (length(args) >= 1 && nzchar(args[1])) {
   Sys.setenv(COVID19_DATA_FILE = args[1])
 }
 
-data_file_path <- Sys.getenv("COVID19_DATA_FILE", unset = file.path("data", "covid19_data.xlsx"))
+data_file_path <- Sys.getenv(
+  "COVID19_DATA_FILE",
+  unset = "~/Downloads/untitled folder/Mortality_incidence_sociodemographic_and_clinical_data_in_COVID19_patients 7.xlsx"
+)
 
 train_fraction   <- 0.80
 m                <- 5
@@ -120,7 +125,9 @@ missing_props_by_scenario <- list(
 )
 
 methods <- c("pmm", "rf", "cart", "norm", "midastouch")
-method_order <- c("Complete", "PMM", "RF", "CART", "NORM", "MIDASTOUCH", "Stacking")
+method_order <- c("Complete", "CCA", "Mean", "MissInd", "MissForest",
+                  "PMM", "RF", "CART", "NORM", "MIDASTOUCH",
+                  "MIE_SE_GLM", "MIE_SE_KNN", "MIE_SE_DT", "Stacking")
 classifier_models <- c("GLM", "KNN", "DT")
 
 cv_folds_standard <- 5
@@ -139,9 +146,9 @@ read_covid_data <- function(file_path) {
     message("Using existing object: COVID19")
     return(as.data.frame(get("COVID19", envir = .GlobalEnv)))
   }
-
+  
   file_path <- path.expand(file_path)
-
+  
   if (!file.exists(file_path)) {
     stop(paste0(
       "COVID-19 data file not found at: ", file_path, "\n",
@@ -149,9 +156,9 @@ read_covid_data <- function(file_path) {
       "or set COVID19_DATA_FILE."
     ))
   }
-
+  
   ext <- tolower(tools::file_ext(file_path))
-
+  
   if (ext %in% c("xlsx", "xls")) {
     out <- readxl::read_excel(file_path)
   } else if (ext == "csv") {
@@ -163,19 +170,19 @@ read_covid_data <- function(file_path) {
   } else {
     stop("Unsupported file type. Use .xlsx, .xls, or .csv.")
   }
-
+  
   as.data.frame(out)
 }
 
 prepare_covid_data <- function(file_path) {
   covid_raw <- read_covid_data(file_path)
-
+  
   required_source_cols <- c(
     "Death", "Age...27", "LOS", "Severity", "OsSats", "MAP", "Ddimer", "Plts",
     "BUN", "Creatinine", "Sodium", "Glucose", "AST", "ALT", "WBC", "IL6",
     "Ferritin", "CrctProtein", "Procalcitonin"
   )
-
+  
   missing_source <- setdiff(required_source_cols, names(covid_raw))
   if (length(missing_source) > 0) {
     stop(paste0(
@@ -183,7 +190,7 @@ prepare_covid_data <- function(file_path) {
       paste(missing_source, collapse = ", ")
     ))
   }
-
+  
   dat <- covid_raw %>%
     dplyr::select(
       Death,
@@ -206,45 +213,45 @@ prepare_covid_data <- function(file_path) {
       CrctProtein,
       Procalcitonin
     )
-
+  
   required_cols <- c(
     "Death", "Age", "LOS", "Severity", "OsSats", "MAP", "Ddimer", "Plts",
     "BUN", "Creatinine", "Sodium", "Glucose", "AST", "ALT", "WBC", "IL6",
     "Ferritin", "CrctProtein", "Procalcitonin"
   )
-
+  
   for (col in required_cols) {
     dat[[col]] <- suppressWarnings(as.numeric(dat[[col]]))
   }
-
+  
   dat <- dat %>%
     dplyr::filter(Death %in% c(0, 1)) %>%
     stats::na.omit()
-
+  
   dat$y <- factor(ifelse(dat$Death == 1, "pos", "neg"), levels = c("neg", "pos"))
   dat$Death <- NULL
-
+  
   dat <- dat[, c(
     "y", "Age", "LOS", "Severity", "OsSats", "MAP", "Ddimer", "Plts",
     "BUN", "Creatinine", "Sodium", "Glucose", "AST", "ALT", "WBC", "IL6",
     "Ferritin", "CrctProtein", "Procalcitonin"
   )]
-
+  
   variable_map <- data.frame(
     Original_Name = names(dat)[-1],
     Model_Name = paste0("x", seq_len(ncol(dat) - 1)),
     stringsAsFactors = FALSE
   )
-
+  
   names(dat) <- c("y", variable_map$Model_Name)
   attr(dat, "variable_map") <- variable_map
-
+  
   cat("COVID-19 dataset loaded successfully.\n")
   cat("Rows after removing original missing values:", nrow(dat), "\n")
   cat("Outcome counts:\n")
   print(table(dat$y))
   cat("\n")
-
+  
   dat
 }
 
@@ -273,25 +280,29 @@ cat("\n")
 # =============================================================================
 
 compute_auc <- function(true_y, pred_prob) {
-  if (length(unique(true_y)) < 2) return(NA_real_)
-  roc_obj <- pROC::roc(true_y, pred_prob, quiet = TRUE)
-  as.numeric(pROC::auc(roc_obj))
+  if (length(unique(na.omit(droplevels(as.factor(true_y))))) < 2) return(NA_real_)
+  tryCatch({
+    roc_obj <- pROC::roc(true_y, pred_prob, quiet = TRUE)
+    as.numeric(pROC::auc(roc_obj))
+  }, error = function(e) NA_real_)
 }
 
 brier_score <- function(true_y, pred_prob) {
-  if (length(unique(true_y)) < 2) return(NA_real_)
-  true_numeric <- as.numeric(true_y == levels(true_y)[2])
-  mean((true_numeric - pred_prob)^2)
+  if (length(unique(na.omit(droplevels(as.factor(true_y))))) < 2) return(NA_real_)
+  true_numeric <- as.numeric(true_y == levels(as.factor(true_y))[2])
+  mean((true_numeric - pred_prob)^2, na.rm = TRUE)
 }
 
 precision_score <- function(true_y, pred_class) {
-  if (length(unique(true_y)) < 2) return(NA_real_)
-  cm <- caret::confusionMatrix(pred_class, true_y, positive = "pos")
-  as.numeric(cm$byClass["Precision"])
+  if (length(unique(na.omit(droplevels(as.factor(true_y))))) < 2) return(NA_real_)
+  tryCatch({
+    cm <- caret::confusionMatrix(pred_class, true_y, positive = "pos")
+    as.numeric(cm$byClass["Precision"])
+  }, error = function(e) NA_real_)
 }
 
 confusion_metrics <- function(true_y, pred_class) {
-  if (length(unique(true_y)) < 2) {
+  if (length(unique(na.omit(droplevels(as.factor(true_y))))) < 2) {
     return(list(
       Sensitivity = NA_real_,
       Specificity = NA_real_,
@@ -314,6 +325,19 @@ confusion_metrics <- function(true_y, pred_class) {
     Sensitivity = sensitivity,
     Specificity = specificity,
     F1          = f1
+  )
+}
+
+compute_calibration <- function(obs_y, pred_prob) {
+  if (is.factor(obs_y)) obs_y_num <- as.numeric(obs_y == "pos") else obs_y_num <- as.numeric(obs_y)
+  pred_prob <- pmin(pmax(as.numeric(pred_prob), 1e-6), 1 - 1e-6)
+  if (length(unique(na.omit(obs_y_num))) < 2 || sum(!is.na(pred_prob)) < 5)
+    return(list(cal_slope = NA_real_, cal_intercept = NA_real_))
+  logit_pred <- log(pred_prob / (1 - pred_prob))
+  cal_fit <- tryCatch(glm(obs_y_num ~ logit_pred, family = binomial()), error = function(e) NULL)
+  list(
+    cal_slope     = if (!is.null(cal_fit)) as.numeric(coef(cal_fit)[2]) else NA_real_,
+    cal_intercept = if (!is.null(cal_fit)) as.numeric(coef(cal_fit)[1]) else NA_real_
   )
 }
 
@@ -520,42 +544,33 @@ fit_model_with_cv_predictions <- function(train_df, test_df, model_type, seed, c
   
   set.seed(seed)
   
-  if (model_type == "GLM") {
-    model_fit <- suppressWarnings(
-      caret::train(
-        y ~ .,
-        data      = train_df,
-        method    = "glm",
-        family    = "binomial",
-        trControl = train_control,
-        metric    = "ROC"
-      )
-    )
-  } else if (model_type == "KNN") {
-    model_fit <- suppressWarnings(
-      caret::train(
-        y ~ .,
-        data       = train_df,
-        method     = "knn",
-        trControl  = train_control,
-        metric     = "ROC",
-        preProcess = c("center", "scale"),
-        tuneGrid   = get_knn_grid()
-      )
-    )
-  } else if (model_type == "DT") {
-    model_fit <- suppressWarnings(
-      caret::train(
-        y ~ .,
-        data      = train_df,
-        method    = "rpart",
-        trControl = train_control,
-        metric    = "ROC",
-        tuneGrid  = get_dt_grid()
-      )
-    )
-  } else {
-    stop("Unsupported model_type")
+  model_fit <- tryCatch({
+    if (model_type == "GLM") {
+      suppressWarnings(caret::train(y ~ ., data = train_df, method = "glm",
+                                    family = "binomial", trControl = train_control, metric = "ROC"))
+    } else if (model_type == "KNN") {
+      suppressWarnings(caret::train(y ~ ., data = train_df, method = "knn",
+                                    trControl = train_control, metric = "ROC",
+                                    preProcess = c("center", "scale"), tuneGrid = get_knn_grid()))
+    } else if (model_type == "DT") {
+      suppressWarnings(caret::train(y ~ ., data = train_df, method = "rpart",
+                                    trControl = train_control, metric = "ROC", tuneGrid = get_dt_grid()))
+    } else {
+      stop("Unsupported model_type")
+    }
+  }, error = function(e) {
+    message("  [fit_model_with_cv_predictions] caret failed (", model_type, "): ", e$message)
+    NULL
+  })
+  
+  if (is.null(model_fit)) {
+    n_train <- nrow(train_df)
+    base_rate <- mean(train_df$y == "pos", na.rm = TRUE)
+    dummy_cv <- data.frame(rowIndex = seq_len(n_train),
+                           obs      = train_df$y,
+                           pos      = rep(base_rate, n_train))
+    dummy_test <- rep(base_rate, nrow(test_df))
+    return(list(model = NULL, cv_pred = dummy_cv, test_prob = dummy_test))
   }
   
   cv_pred <- model_fit$pred
@@ -699,7 +714,24 @@ for (scenario_name in names(source_datasets)) {
   dat <- source_datasets[[scenario_name]]
   missing_props <- missing_props_by_scenario[[scenario_name]]
   
-  scenario_results <- data.frame()
+  # ---- CHECKPOINT: load previous progress for this scenario ----------------
+  checkpoint_file <- file.path(output_dir, paste0("checkpoint_", scenario_name, "_raw_results.csv"))
+  
+  if (file.exists(checkpoint_file)) {
+    cat("=== CHECKPOINT FOUND for", scenario_name, "— resuming ===\n")
+    scenario_results <- readr::read_csv(checkpoint_file, show_col_types = FALSE)
+    scenario_results$Imputation_Method <- as.character(scenario_results$Imputation_Method)
+    cat("Checkpoint: loaded", nrow(scenario_results), "rows covering",
+        length(unique(paste(scenario_results$Missing_Proportion, scenario_results$Split))),
+        "completed splits\n\n")
+    completed_keys <- unique(paste(scenario_results$Missing_Proportion,
+                                   scenario_results$Split, sep = "_"))
+  } else {
+    scenario_results <- data.frame()
+    completed_keys   <- character(0)
+    cat("No checkpoint found for", scenario_name, "— starting fresh.\n\n")
+  }
+  
   scenario_missingness_variable <- data.frame()
   scenario_missingness_overall  <- data.frame()
   
@@ -712,9 +744,18 @@ for (scenario_name in names(source_datasets)) {
     cat("Missing proportion:", prop, "\n")
     
     for (split_id in seq_len(n_random_splits)) {
+      
+      # ---- Skip if already completed ----------------------------------------
+      split_key <- paste(prop, split_id, sep = "_")
+      if (split_key %in% completed_keys) {
+        cat("  Split", split_id, "- skipping (checkpoint)\n")
+        next
+      }
+      
       cat("  Random split:", split_id, "of", n_random_splits, "\n")
       
-      data_seed <- main_seed + prop_idx * 1000 + split_id * 10000
+      data_seed <- main_seed + (round(prop * 10) + 1) * 1000 + split_id * 10000
+      n_before_split <- nrow(scenario_results)   # track new rows for checkpoint
       
       set.seed(data_seed + 1)
       index <- createDataPartition(dat$y, p = train_fraction, list = FALSE)
@@ -836,6 +877,15 @@ for (scenario_name in names(source_datasets)) {
           ))
         }
         
+        # Save checkpoint for prop==0 split
+        new_rows <- if (nrow(scenario_results) > n_before_split)
+          scenario_results[(n_before_split + 1):nrow(scenario_results), ] else data.frame()
+        if (nrow(new_rows) > 0) {
+          readr::write_csv(new_rows, checkpoint_file,
+                           append = file.exists(checkpoint_file))
+          completed_keys <- c(completed_keys, split_key)
+          cat("  Checkpoint saved (prop=", prop, ", split=", split_id, ")\n", sep = "")
+        }
         next
       }
       
@@ -917,6 +967,7 @@ for (scenario_name in names(source_datasets)) {
           
           test_class <- factor(ifelse(pooled_test_prob >= model_threshold, "pos", "neg"), levels = c("neg", "pos"))
           test_cm_stats <- confusion_metrics(test_y, test_class)
+          cal_mice <- compute_calibration(test_y, pooled_test_prob)
           
           scenario_results <- bind_rows(scenario_results, data.frame(
             Scenario           = scenario_name,
@@ -938,11 +989,129 @@ for (scenario_name in names(source_datasets)) {
             Test_Specificity   = test_cm_stats$Specificity,
             Train_F1           = train_cm_stats$F1,
             Test_F1            = test_cm_stats$F1,
-            Threshold          = model_threshold
+            Threshold          = model_threshold,
+            Cal_Slope          = cal_mice$cal_slope,
+            Cal_Intercept      = cal_mice$cal_intercept
           ))
         }
       }
       
+      # ---- Simple baselines: CCA, Mean, MissInd, MissForest -------------------
+      
+      # Helper: store a single-imputation result row for COVID-19
+      store_single_result <- function(method_name, clf, cv_p, test_prob_vec) {
+        thresh  <- find_optimal_threshold(cv_p$obs, cv_p$pos)
+        tr_cl   <- factor(ifelse(cv_p$pos      >= thresh, "pos", "neg"), levels = c("neg", "pos"))
+        te_cl   <- factor(ifelse(test_prob_vec >= thresh, "pos", "neg"), levels = c("neg", "pos"))
+        tr_cm   <- confusion_metrics(cv_p$obs, tr_cl)
+        te_cm   <- confusion_metrics(test_y,   te_cl)
+        cal     <- compute_calibration(test_y, test_prob_vec)
+        data.frame(
+          Scenario           = scenario_name,
+          Split              = split_id,
+          Missing_Proportion = prop,
+          Imputation_Method  = method_name,
+          Model              = clf,
+          Train_AUC          = compute_auc(cv_p$obs, cv_p$pos),
+          Test_AUC           = compute_auc(test_y, test_prob_vec),
+          Train_Accuracy     = mean(tr_cl == cv_p$obs),
+          Test_Accuracy      = mean(te_cl == test_y),
+          Train_Brier        = brier_score(cv_p$obs, cv_p$pos),
+          Test_Brier         = brier_score(test_y, test_prob_vec),
+          Train_Precision    = precision_score(cv_p$obs, tr_cl),
+          Test_Precision     = precision_score(test_y, te_cl),
+          Train_Sensitivity  = tr_cm$Sensitivity,
+          Test_Sensitivity   = te_cm$Sensitivity,
+          Train_Specificity  = tr_cm$Specificity,
+          Test_Specificity   = te_cm$Specificity,
+          Train_F1           = tr_cm$F1,
+          Test_F1            = te_cm$F1,
+          Threshold          = thresh,
+          Cal_Slope          = cal$cal_slope,
+          Cal_Intercept      = cal$cal_intercept
+        )
+      }
+      
+      # 1) CCA - complete cases only in training; test missing filled with train means
+      cat("    Method: CCA\n")
+      cca_complete <- complete.cases(train_x)
+      if (sum(cca_complete) >= 10) {
+        train_x_cca     <- train_x[cca_complete, , drop = FALSE]
+        train_y_cca     <- train_y[cca_complete]
+        train_means_cca <- colMeans(train_x, na.rm = TRUE)
+        test_x_cca      <- as.data.frame(lapply(names(test_x), function(col) {
+          v <- test_x[[col]]; v[is.na(v)] <- train_means_cca[[col]]; v
+        })); names(test_x_cca) <- names(test_x)
+        train_df_cca <- data.frame(train_x_cca, y = train_y_cca)
+        for (clf in classifier_models) {
+          f <- fit_model_with_cv_predictions(train_df_cca, test_x_cca, clf,
+                                             seed     = data_seed + 30000 + match(clf, classifier_models) * 10,
+                                             cv_folds = cv_folds_standard)
+          scenario_results <- bind_rows(scenario_results,
+                                        store_single_result("CCA", clf, f$cv_pred, f$test_prob))
+        }
+      }
+      
+      # 2) Mean imputation - column mean from train, applied to train & test
+      cat("    Method: Mean Imputation\n")
+      train_means_m <- colMeans(train_x, na.rm = TRUE)
+      train_x_mean  <- train_x; test_x_mean <- test_x
+      for (col in names(train_x_mean)) {
+        train_x_mean[[col]][is.na(train_x_mean[[col]])] <- train_means_m[[col]]
+        test_x_mean[[col]][is.na(test_x_mean[[col]])]   <- train_means_m[[col]]
+      }
+      train_df_mean <- data.frame(train_x_mean, y = train_y)
+      for (clf in classifier_models) {
+        f <- fit_model_with_cv_predictions(train_df_mean, test_x_mean, clf,
+                                           seed     = data_seed + 31000 + match(clf, classifier_models) * 10,
+                                           cv_folds = cv_folds_standard)
+        scenario_results <- bind_rows(scenario_results,
+                                      store_single_result("Mean", clf, f$cv_pred, f$test_prob))
+      }
+      
+      # 3) Missing Indicator - binary flag per missing predictor + mean-fill (Van Ness et al. 2023)
+      cat("    Method: Missing Indicator\n")
+      has_miss_cols <- names(train_x)[sapply(train_x, function(x) any(is.na(x)))]
+      train_x_ind <- train_x; test_x_ind <- test_x
+      for (col in has_miss_cols) {
+        train_x_ind[[paste0(col, "_miss")]] <- as.numeric(is.na(train_x[[col]]))
+        test_x_ind[[paste0(col,  "_miss")]] <- as.numeric(is.na(test_x[[col]]))
+        train_x_ind[[col]][is.na(train_x_ind[[col]])] <- train_means_m[[col]]
+        test_x_ind[[col]][is.na(test_x_ind[[col]])]   <- train_means_m[[col]]
+      }
+      train_df_ind <- data.frame(train_x_ind, y = train_y)
+      for (clf in classifier_models) {
+        f <- fit_model_with_cv_predictions(train_df_ind, test_x_ind, clf,
+                                           seed     = data_seed + 32000 + match(clf, classifier_models) * 10,
+                                           cv_folds = cv_folds_standard)
+        scenario_results <- bind_rows(scenario_results,
+                                      store_single_result("MissInd", clf, f$cv_pred, f$test_prob))
+      }
+      
+      # 4) MissForest - single imputation via random forests (train+test combined)
+      cat("    Method: MissForest\n")
+      n_train_mf    <- nrow(train_x)
+      combined_x_mf <- rbind(as.data.frame(train_x), as.data.frame(test_x))
+      set.seed(data_seed + 33000)
+      mf_out <- tryCatch(
+        missForest::missForest(combined_x_mf, verbose = FALSE),
+        error = function(e) { message("MissForest failed: ", e$message); NULL }
+      )
+      if (!is.null(mf_out)) {
+        cimp         <- as.data.frame(mf_out$ximp)
+        train_x_mf  <- cimp[seq_len(n_train_mf), , drop = FALSE]
+        test_x_mf   <- cimp[(n_train_mf + 1):nrow(cimp), , drop = FALSE]
+        train_df_mf <- data.frame(train_x_mf, y = train_y)
+        for (clf in classifier_models) {
+          f <- fit_model_with_cv_predictions(train_df_mf, test_x_mf, clf,
+                                             seed     = data_seed + 33000 + match(clf, classifier_models) * 10,
+                                             cv_folds = cv_folds_standard)
+          scenario_results <- bind_rows(scenario_results,
+                                        store_single_result("MissForest", clf, f$cv_pred, f$test_prob))
+        }
+      }
+      
+      # ---- Imputation-based stacking ----------------------------------------
       for (clf in classifier_models) {
         stacking_train_list <- vector("list", m)
         stacking_test_mat   <- matrix(NA_real_, nrow = nrow(test_x), ncol = m)
@@ -1031,6 +1200,7 @@ for (scenario_name in names(source_datasets)) {
         
         stacking_class <- factor(ifelse(stacking_pred_avg >= final_stack_threshold, "pos", "neg"), levels = c("neg", "pos"))
         stack_test_cm  <- confusion_metrics(test_y, stacking_class)
+        cal_stack      <- compute_calibration(test_y, stacking_pred_avg)
         
         scenario_results <- bind_rows(scenario_results, data.frame(
           Scenario           = scenario_name,
@@ -1052,8 +1222,108 @@ for (scenario_name in names(source_datasets)) {
           Test_Specificity   = stack_test_cm$Specificity,
           Train_F1           = stack_train_cm$F1,
           Test_F1            = stack_test_cm$F1,
-          Threshold          = final_stack_threshold
+          Threshold          = final_stack_threshold,
+          Cal_Slope          = cal_stack$cal_slope,
+          Cal_Intercept      = cal_stack$cal_intercept
         ))
+      }
+      
+      # ---- MIE_SE: Multiple Imputation Ensemble Stacking (Aleryani et al.) ------
+      # MICE_SE variant: PMM (m=5 draws) x GLM+KNN+DT = 15 OOF predictions as meta-features.
+      # Meta-learner runs once per classifier → 3 rows: MIE_SE_GLM, MIE_SE_KNN, MIE_SE_DT.
+      # Base model seeds: 20000 range. Meta-learner seeds: data_seed + 25000 range.
+      cat("    Method: MIE_SE (PMM x GLM+KNN+DT, per-clf meta-learner)\n")
+      
+      mie_se_oof_list  <- list()
+      mie_se_test_list <- list()
+      mie_se_idx <- 1
+      
+      for (imp_idx in seq_len(m)) {
+        for (clf in classifier_models) {
+          fit_mie <- fit_model_with_cv_predictions(
+            train_df   = train_imputed[["pmm"]][[imp_idx]],
+            test_df    = test_imputed[["pmm"]][[imp_idx]],
+            model_type = clf,
+            seed       = data_seed + 20000 + match(clf, classifier_models) * 10 + imp_idx,
+            cv_folds   = cv_folds_standard
+          )
+          col_name <- paste0("pmm_k", imp_idx, "_", clf, "_pred")
+          mie_se_oof_list[[mie_se_idx]]  <- fit_mie$cv_pred %>%
+            transmute(row_id = rowIndex, !!col_name := pos)
+          mie_se_test_list[[mie_se_idx]] <- fit_mie$test_prob
+          mie_se_idx <- mie_se_idx + 1
+        }
+      }
+      
+      mie_se_oof <- Reduce(function(x, y) full_join(x, y, by = "row_id"), mie_se_oof_list) %>%
+        arrange(row_id)
+      mie_se_meta_cols <- grep("_pred$", names(mie_se_oof), value = TRUE)
+      
+      meta_train_mie <- data.frame(
+        y = train_y[mie_se_oof$row_id],
+        mie_se_oof[, mie_se_meta_cols]
+      )
+      mie_se_test_df <- as.data.frame(do.call(cbind, mie_se_test_list))
+      colnames(mie_se_test_df) <- mie_se_meta_cols
+      
+      # One meta-learner per classifier
+      for (clf_meta in classifier_models) {
+        mie_label <- paste0("MIE_SE_", clf_meta)
+        f_meta <- fit_model_with_cv_predictions(
+          train_df   = meta_train_mie,
+          test_df    = mie_se_test_df,
+          model_type = clf_meta,
+          seed       = data_seed + 25000 + match(clf_meta, classifier_models) * 100,
+          cv_folds   = cv_folds_meta
+        )
+        meta_oof <- f_meta$cv_pred %>% arrange(rowIndex)
+        mie_se_train_prob <- meta_oof$pos
+        mie_se_train_obs  <- meta_oof$obs
+        mie_se_train_prob[!is.finite(mie_se_train_prob)] <- mean(train_y == "pos")
+        thresh_mie_se      <- find_optimal_threshold(mie_se_train_obs, mie_se_train_prob)
+        mie_se_train_class <- factor(ifelse(mie_se_train_prob >= thresh_mie_se, "pos", "neg"), levels = c("neg", "pos"))
+        mie_se_train_cm    <- confusion_metrics(mie_se_train_obs, mie_se_train_class)
+        
+        mie_se_test_prob  <- f_meta$test_prob
+        mie_se_test_prob[!is.finite(mie_se_test_prob)] <- mean(train_y == "pos")
+        mie_se_test_class <- factor(ifelse(mie_se_test_prob >= thresh_mie_se, "pos", "neg"), levels = c("neg", "pos"))
+        mie_se_test_cm    <- confusion_metrics(test_y, mie_se_test_class)
+        cal_mie           <- compute_calibration(test_y, mie_se_test_prob)
+        
+        scenario_results <- bind_rows(scenario_results, data.frame(
+          Scenario           = scenario_name,
+          Split              = split_id,
+          Missing_Proportion = prop,
+          Imputation_Method  = mie_label,
+          Model              = mie_label,
+          Train_AUC          = compute_auc(mie_se_train_obs, mie_se_train_prob),
+          Test_AUC           = compute_auc(test_y, mie_se_test_prob),
+          Train_Accuracy     = mean(mie_se_train_class == mie_se_train_obs),
+          Test_Accuracy      = mean(mie_se_test_class == test_y),
+          Train_Brier        = brier_score(mie_se_train_obs, mie_se_train_prob),
+          Test_Brier         = brier_score(test_y, mie_se_test_prob),
+          Train_Precision    = precision_score(mie_se_train_obs, mie_se_train_class),
+          Test_Precision     = precision_score(test_y, mie_se_test_class),
+          Train_Sensitivity  = mie_se_train_cm$Sensitivity,
+          Test_Sensitivity   = mie_se_test_cm$Sensitivity,
+          Train_Specificity  = mie_se_train_cm$Specificity,
+          Test_Specificity   = mie_se_test_cm$Specificity,
+          Train_F1           = mie_se_train_cm$F1,
+          Test_F1            = mie_se_test_cm$F1,
+          Threshold          = thresh_mie_se,
+          Cal_Slope          = cal_mie$cal_slope,
+          Cal_Intercept      = cal_mie$cal_intercept
+        ))
+      }
+      
+      # ---- Save checkpoint after each split ----------------------------------
+      new_rows <- if (nrow(scenario_results) > n_before_split)
+        scenario_results[(n_before_split + 1):nrow(scenario_results), ] else data.frame()
+      if (nrow(new_rows) > 0) {
+        readr::write_csv(new_rows, checkpoint_file,
+                         append = file.exists(checkpoint_file))
+        completed_keys <- c(completed_keys, split_key)
+        cat("  Checkpoint saved (prop=", prop, ", split=", split_id, ")\n", sep = "")
       }
     }
   }
@@ -1738,4 +2008,3 @@ cat("
 Run R/02_covid19_figures.R to generate manuscript figures.
 ")
 cat("  - results_backup.RData\n")
-
